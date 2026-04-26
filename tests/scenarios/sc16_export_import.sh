@@ -12,4 +12,4 @@ cprof export default "$HOME/default-export.tgz"
 # Import as a different name.
 cprof import "$HOME/default-export.tgz" --name imported
 assert_dir "$HOME/.claude-profiler/profiles/imported"
-assert_grep '"theme":"dark"' "$HOME/.claude-profiler/profiles/imported/settings.json"
+assert_grep '"theme":[[:space:]]*"dark"' "$HOME/.claude-profiler/profiles/imported/settings.json"

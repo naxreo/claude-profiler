@@ -57,9 +57,12 @@ claude-profiler list [--quiet] [--json]
 
 ```bash
 claude-profiler current
+claude-profiler           # 인자 없이 호출해도 동일 (단축형)
 ```
 
-활성 프로파일 이름을 출력. 셸 변수에 캡처할 때 유용:
+활성 프로파일 이름을 출력. 인자 없이 `claude-profiler` 만 입력해도 같은 결과를 보여주므로, 가볍게 현재 상태를 확인할 때 편리합니다. 단, **초기화되지 않은 상태에서 인자 없이 호출하면 사용법(usage)이 출력**됩니다.
+
+셸 변수에 캡처할 때:
 ```bash
 profile=$(claude-profiler current)
 ```
@@ -87,21 +90,26 @@ claude-profiler switch <name> [--force]
 ## create
 
 ```bash
-claude-profiler create <name> [--from <src>] [--empty]
+claude-profiler create <name> [--from <src> | --empty]
 ```
 
+기본 동작 — 옵션을 생략하면 **현재 활성 프로파일을 복제**합니다. 인증(`.credentials.json`), MCP 설정, skills/agents 등이 그대로 따라옵니다. 이는 "현재 환경을 그대로 가져가서 거기서 분기하고 싶다"는 가장 흔한 의도에 맞춘 안전 디폴트입니다.
+
 옵션
-- `--from <src>` — 다른 프로파일을 복제하여 생성
-- `--empty` — 옵션 미지정 시 기본값 (빈 프로파일)
+- `--from <src>` — 지정한 프로파일을 복제 (현재가 아니라 다른 프로파일에서 분기하고 싶을 때)
+- `--empty` — 인증/설정이 모두 비어 있는 클린 슬레이트로 생성. **이 경우 스위칭 후 Claude Code 재인증이 필요**합니다. (`vanilla`와 동일한 상태)
+- `--from` 과 `--empty` 는 함께 사용할 수 없습니다 (의도 충돌, 종료 코드 2).
 
 예
 ```bash
-claude-profiler create work                   # 빈 프로파일
-claude-profiler create work --from default    # default를 그대로 복제
+claude-profiler create work                   # 현재 활성 프로파일을 복제 (기본)
+claude-profiler create work --from default    # default 를 명시적으로 복제
+claude-profiler create work --from vanilla    # vanilla 에서 복제 (재인증 필요)
+claude-profiler create scratch --empty        # 완전히 빈 프로파일 (재인증 필요)
 ```
 
 종료 코드
-- 0 성공 / 2 잘못된 이름 / 3 원본 없음 / 6 예약어 / 7 이미 존재
+- 0 성공 / 2 잘못된 사용법(이름·옵션 충돌) / 3 원본 없음 / 6 예약어 / 7 이미 존재 / 30 현재 활성 프로파일 확인 불가
 
 ---
 
@@ -196,6 +204,127 @@ claude-profiler uninstall --keep-data
 ```bash
 tar -xzf ~/uninstall-snapshot-<ts>.tgz -C ~
 ```
+
+---
+
+## update
+
+```bash
+claude-profiler update [--from <git-url|local-path>] [--ref <branch|tag>] [--check] [--yes]
+```
+
+설치된 `claude-profiler` 바이너리를 새 버전으로 갱신합니다. **사용자 데이터(`~/.claude-profiler/`)와 셸 rc 마커는 건드리지 않습니다** — 바이너리와 완성(completions) 파일만 교체.
+
+### 소스 지정
+
+업데이트 소스는 다음 우선순위로 결정됩니다.
+
+1. `--from <url-or-path>` — 명시적 지정 (가장 우선).
+2. 환경 변수 `CPROF_UPDATE_URL` — 셸 rc 또는 CI 환경에서 고정해두고 사용.
+3. 둘 다 없으면 에러로 종료 (코드 2).
+
+소스가 **로컬 디렉토리**면 그대로 사용하고, **URL**(git 저장소)이면 `git clone --depth 1` 으로 임시 디렉토리에 가져온 뒤 빌드합니다. `--ref` 로 브랜치 또는 태그를 지정할 수 있습니다.
+
+### 소스 형태 자동 감지
+
+| 소스 구성 | 동작 |
+|----------|------|
+| `build.sh` + `src/` 존재 | `build.sh` 로 재빌드 후 `dist/install.sh` 로 설치 |
+| `dist/install.sh` + `dist/claude-profiler` 만 존재 | 빌드 건너뛰고 즉시 설치 (릴리스 tarball 호환) |
+| 둘 다 아님 | 종료 코드 1 |
+
+### 동작 흐름
+
+1. 실행 중 바이너리 경로(`$BASH_SOURCE`)에서 `$PREFIX/bin/claude-profiler` 패턴을 검출하여 설치 prefix 추론.
+2. 소스 확보(로컬은 그대로, URL은 shallow clone).
+3. 새 버전을 `build.sh` 의 `VERSION="${VERSION:-X.Y.Z}"` 라인에서 추출하여 현재 버전과 함께 표시.
+4. 사용자 확인(`--yes` 로 우회 가능).
+5. lock 획득 → 빌드(필요 시) → `dist/install.sh --prefix <검출> --no-shell` 실행.
+6. lock 해제 + 임시 디렉토리 정리.
+
+### 옵션
+
+- `--from <git-url|local-path>` — 업데이트 소스. URL은 git 저장소, 경로는 로컬 디렉토리.
+- `--ref <branch|tag>` — 원격 git URL일 때 특정 브랜치/태그를 체크아웃.
+- `--check` — 실제 갱신 없이 현재 버전 vs 새 버전 비교만 출력 (lock 미획득, 임시 디렉토리도 정리).
+- `--yes`, `-y` — 확인 프롬프트 자동 동의.
+
+### 예
+
+```bash
+# 로컬에 클론한 저장소에서 업데이트
+claude-profiler update --from ~/Projects/claude-profiler
+
+# 원격 저장소 main 브랜치에서 업데이트
+claude-profiler update --from https://example.org/claude-profiler.git
+
+# 특정 태그로 업데이트
+claude-profiler update --from https://example.org/claude-profiler.git --ref v0.2.0
+
+# 환경 변수로 고정해두고 짧게 호출
+export CPROF_UPDATE_URL=https://example.org/claude-profiler.git
+claude-profiler update --check       # 새 버전 가용 여부만 확인
+claude-profiler update --yes         # 바로 갱신
+```
+
+### 안전 사항
+
+- `~/.claude-profiler/` 의 프로파일·백업·통합 git 저장소는 update 가 **전혀** 건드리지 않습니다.
+- 셸 rc 의 마커 블록도 그대로 유지됩니다 (`--no-shell` 강제).
+- update 중에는 lock(`~/.claude-profiler/.lock`)을 획득하므로 동시 `switch`/`create`/`delete` 와 충돌하지 않습니다.
+- 정상 설치(`$PREFIX/bin/claude-profiler`)가 아닌 경로에서 실행 시 거부됩니다 (개발용 소스 트리에서 직접 실행한 경우 등).
+
+### 종료 코드
+
+- 0 성공 (또는 `--check` 정상 종료) / 1 빌드·설치·git clone 실패, 비정상 설치 위치 / 2 잘못된 사용법 / 4 lock 충돌
+
+---
+
+## 세션 배너 (SessionStart 훅)
+
+`init` 시 활성 프로파일의 `settings.json` 에 SessionStart 훅이 자동 주입됩니다. 이후 `claude` 가 프로젝트에서 시작/재개될 때마다 컨텍스트 첫머리에 다음과 같은 안내가 표시됩니다.
+
+```
+[claude-profiler] 현재 프로파일: default
+
+프로파일 전환 (Claude Code 종료 후 새 셸에서 실행):
+  claude-profiler list             # 사용 가능 프로파일 보기
+  claude-profiler switch <name>    # 다른 프로파일로 전환
+  claude-profiler                  # 현재 프로파일 확인
+```
+
+작동 메커니즘
+- `settings.json` 의 `hooks.SessionStart` 항목으로 `claude-profiler --session-banner` 가 등록됩니다.
+- matcher 는 `startup|resume` 두 상황 모두 매칭.
+- `--session-banner` 는 내부 명령으로, plain text 만 출력하고 미초기화 상태에서는 조용히 종료합니다 (세션 방해 없음).
+
+자동 주입되는 시점
+- `init` — 마이그레이션된 default 프로파일에 주입.
+- `create <name>` (기본/`--from`) — 원본 프로파일에서 클론되며 자연 상속.
+- `create <name> --empty` 또는 `switch vanilla` 자동 생성 — `cprof_profile_seed_empty` 가 빈 settings.json 생성 직후 주입.
+
+기존 `settings.json` 에 사용자 내용이 이미 있을 때
+- `jq` 가 있으면 안전하게 병합 (기존 키 보존).
+- `jq` 가 없으면 사용자 JSON 손상을 막기 위해 **건너뛰고 경고**만 표시. 수동 추가는 아래 형식을 `settings.json` 의 `"hooks"` 키에 추가하세요.
+
+```jsonc
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          { "type": "command", "command": "claude-profiler --session-banner" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+배너 비활성화
+- 활성 프로파일의 `~/.claude/settings.json` 에서 위 항목을 제거하면 됩니다 (영구 비활성).
+- 일시적으로 끄고 싶다면 `claude` 시작 시 `CLAUDE_DISABLE_HOOKS=1` 같은 환경 변수(Claude Code 정책에 따름)를 사용.
 
 ---
 

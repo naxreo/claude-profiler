@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # claude-profiler — single-file build
 # Version: 0.1.0
-# Built: 2026-04-26T13:12:09Z
+# Built: 2026-04-26T14:20:56Z
 set -Eeuo pipefail
 CPROF_VERSION='0.1.0'
 CPROF_BUILT=1
@@ -286,7 +286,64 @@ cprof_profile_seed_empty() {
   if [[ ! -f "$dir/_home/.claude.json" ]]; then
     printf '{}\n' >"$dir/_home/.claude.json"
   fi
+  cprof_inject_session_hook "$dir/settings.json" || true
   chmod 0700 "$dir" 2>/dev/null || true
+}
+
+# cprof_inject_session_hook <settings.json path>
+# settings.json 에 SessionStart 훅을 주입한다 (idempotent).
+# - 파일이 없거나 사실상 빈 객체({})면 우리 훅만 가진 새 파일 작성.
+# - jq 가용 + 사용자 내용 존재: jq 로 안전 병합.
+# - jq 없음 + 사용자 내용 존재: 사용자 JSON 손상 위험 → 경고 후 건너뜀.
+# 항상 0 반환 (init/seed 흐름을 깨지 않음). 실제 실패 시 경고만.
+cprof_inject_session_hook() {
+  local settings="$1"
+  local marker='claude-profiler --session-banner'
+
+  if [[ -f "$settings" ]] && grep -q "$marker" "$settings" 2>/dev/null; then
+    return 0
+  fi
+
+  local fresh
+  fresh='{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          { "type": "command", "command": "claude-profiler --session-banner" }
+        ]
+      }
+    ]
+  }
+}'
+
+  if [[ ! -s "$settings" ]] || [[ "$(tr -d '[:space:]' <"$settings")" == "{}" ]]; then
+    printf '%s\n' "$fresh" >"$settings"
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    local tmp="${settings}.cprof-tmp.$$"
+    if jq '
+      .hooks //= {}
+      | .hooks.SessionStart //= []
+      | .hooks.SessionStart += [{
+          "matcher": "startup|resume",
+          "hooks": [{ "type": "command", "command": "claude-profiler --session-banner" }]
+        }]
+    ' "$settings" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$settings"
+      return 0
+    fi
+    rm -f "$tmp"
+    cprof_warn "settings.json JSON 병합 실패 — SessionStart 훅 주입 건너뜀: $settings"
+    return 0
+  fi
+
+  cprof_warn "기존 settings.json 에 내용이 있고 jq 가 없어 SessionStart 배너 훅 주입을 건너뜁니다: $settings"
+  cprof_dim "  수동 추가 방법은 docs/USAGE.md '세션 배너' 섹션 참고."
+  return 0
 }
 
 cprof_profile_create() {
@@ -297,12 +354,15 @@ cprof_profile_create() {
     return 7
   fi
   local target_dir="$(cprof_profile_dir "$name")"
-  if [[ -n "$from" ]]; then
+  if [[ "$empty" == "1" ]]; then
+    cprof_profile_seed_empty "$name" || return 20
+  elif [[ -n "$from" ]]; then
     cprof_profile_exists "$from" || { cprof_error "원본 프로파일이 없습니다: $from"; return 3; }
     mkdir -p "$(dirname "$target_dir")"
     cprof_cp_preserve "$(cprof_profile_dir "$from")" "$target_dir" || return 20
-  elif [[ "$empty" == "1" ]] || [[ -z "$from" ]]; then
-    cprof_profile_seed_empty "$name" || return 20
+  else
+    cprof_error "내부 오류: from 또는 empty 중 하나가 지정되어야 합니다."
+    return 2
   fi
   chmod 0700 "$target_dir" 2>/dev/null || true
   return 0
@@ -840,7 +900,8 @@ claude-profiler — Claude Code 프로파일 관리 도구 (v$CPROF_VERSION)
   list                    프로파일 목록 출력 (활성에 * 표시)
   current                 현재 활성 프로파일 이름 출력
   switch <name>           프로파일 전환. <name>=vanilla 이고 미존재 시 자동 생성.
-  create <name>           새 프로파일 생성. --from <src>로 복제, --empty로 빈 프로파일.
+  create <name>           새 프로파일 생성. 기본은 **현재 활성 프로파일을 복제**.
+                          --from <src>로 다른 프로파일에서 복제, --empty로 빈 프로파일.
   delete <name>           프로파일 삭제 (활성은 거부). 자동 백업.
   rename <old> <new>      이름 변경.
   export <name> <path>    프로파일을 tarball로 내보내기.
@@ -849,6 +910,8 @@ claude-profiler — Claude Code 프로파일 관리 도구 (v$CPROF_VERSION)
   backup prune [--older-than <days>]  오래된 백업 정리.
   backup restore <name>   특정 백업을 임시 위치에 추출.
   uninstall               도구 제거 (옵션은 USAGE 참고).
+  update                  설치된 claude-profiler 자체를 새 버전으로 갱신.
+                          --from <git-url|path> 또는 CPROF_UPDATE_URL 필요.
   doctor                  설정 일관성 검사.
   version                 버전 출력.
   help                    이 도움말.
@@ -981,6 +1044,8 @@ sub_init() {
     [[ -f "$default_dir/_home/.claude.json" ]] || printf '{}\n' >"$default_dir/_home/.claude.json"
   fi
 
+  cprof_inject_session_hook "$default_dir/settings.json" || true
+
   ln -s "$default_dir"                          "$HOME/.claude"
   ln -s "$default_dir/_home/.claude.json"       "$HOME/.claude.json"
 
@@ -1087,7 +1152,15 @@ sub_create() {
     esac
     shift
   done
-  [[ -z "$name" ]] && cprof_die 2 "사용법: claude-profiler create <name> [--from <src>] [--empty]"
+  [[ -z "$name" ]] && cprof_die 2 "사용법: claude-profiler create <name> [--from <src> | --empty]"
+  if [[ "$empty" -eq 1 ]] && [[ -n "$from" ]]; then
+    cprof_die 2 "--from 과 --empty 는 함께 사용할 수 없습니다."
+  fi
+  if [[ "$empty" -eq 0 ]] && [[ -z "$from" ]]; then
+    from="$(cprof_profile_current)"
+    [[ -z "$from" ]] && cprof_die 30 "현재 활성 프로파일을 확인할 수 없습니다. doctor로 진단하세요."
+    cprof_dim "(기본: 현재 활성 프로파일 '$from' 에서 복제. 빈 프로파일이 필요하면 --empty)"
+  fi
   cprof_profile_create "$name" "$from" "$empty"
   cprof_success "프로파일 생성됨: $name"
 }
@@ -1442,6 +1515,174 @@ sub_version() {
   printf 'claude-profiler %s\n' "$CPROF_VERSION"
 }
 
+# 자기 자신의 절대 경로(설치 prefix 추론용).
+cprof_self_path() {
+  local self="${BASH_SOURCE[0]:-$0}"
+  if [[ "$self" == /* ]]; then
+    cprof_realpath "$self"
+  elif [[ "$self" == */* ]]; then
+    cprof_realpath "$(pwd)/$self"
+  else
+    local found
+    found="$(command -v "$self" 2>/dev/null || true)"
+    [[ -n "$found" ]] && cprof_realpath "$found" || printf '%s\n' "$self"
+  fi
+}
+
+# build.sh 에서 VERSION="${VERSION:-X.Y.Z}" 라인을 추출.
+cprof_extract_version_from_buildsh() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  awk -F'"' '/^VERSION="\$\{VERSION:-/ { sub(/^\$\{VERSION:-/, "", $2); sub(/\}$/, "", $2); print $2; exit }' "$f"
+}
+
+sub_update() {
+  local opt_from="" opt_ref="" opt_check=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) opt_from="$2"; shift ;;
+      --ref) opt_ref="$2"; shift ;;
+      --check) opt_check=1 ;;
+      --yes|-y) CPROF_FLAG_YES=1 ;;
+      -*) cprof_die 2 "알 수 없는 옵션: $1" ;;
+      *) cprof_die 2 "예기치 않은 인자: $1" ;;
+    esac
+    shift
+  done
+
+  # 1. 설치 위치 추론. install.sh 가 만든 $PREFIX/bin/claude-profiler 패턴이어야 함.
+  local self_path bin_dir prefix
+  self_path="$(cprof_self_path)"
+  bin_dir="$(dirname "$self_path")"
+  if [[ "$(basename "$bin_dir")" != "bin" ]]; then
+    cprof_error "정상 설치된 위치가 아닙니다: $self_path"
+    cprof_dim "  update 는 install.sh 로 \$PREFIX/bin/claude-profiler 에 설치된 경우에만 동작합니다."
+    cprof_dim "  개발용 빌드를 갱신하려면 'bash build.sh' 후 'bash dist/install.sh' 를 직접 실행하세요."
+    return 1
+  fi
+  prefix="$(dirname "$bin_dir")"
+
+  # 2. 소스 결정
+  local src="${opt_from:-${CPROF_UPDATE_URL:-}}"
+  if [[ -z "$src" ]]; then
+    cprof_error "업데이트 소스가 지정되지 않았습니다."
+    cprof_dim "  옵션: claude-profiler update --from <git-url|local-path> [--ref <branch|tag>]"
+    cprof_dim "  또는 환경 변수: CPROF_UPDATE_URL=<url>"
+    return 2
+  fi
+
+  # 3. 소스 확보 — 로컬 디렉토리는 그대로, URL은 shallow clone
+  local src_dir cleanup_src=0
+  if [[ -d "$src" ]]; then
+    src_dir="$(cprof_realpath "$src")"
+  else
+    cprof_have_git || cprof_die 1 "git 이 설치되지 않아 원격 URL 을 사용할 수 없습니다."
+    cprof_step "원격 소스 fetch: $src${opt_ref:+ (ref: $opt_ref)}"
+    local tmp
+    tmp="$(cprof_mktempd cprof-update)"
+    local clone_args=(--depth 1)
+    [[ -n "$opt_ref" ]] && clone_args+=(--branch "$opt_ref")
+    if ! git clone "${clone_args[@]}" "$src" "$tmp" >/dev/null 2>&1; then
+      rm -rf "$tmp"
+      cprof_die 1 "git clone 실패: $src"
+    fi
+    src_dir="$tmp"
+    cleanup_src=1
+  fi
+
+  # 4. 소스 형태 감지
+  local mode=""
+  if [[ -f "$src_dir/build.sh" ]] && [[ -d "$src_dir/src" ]]; then
+    mode="rebuild"
+  elif [[ -f "$src_dir/dist/install.sh" ]] && [[ -f "$src_dir/dist/claude-profiler" ]]; then
+    mode="prebuilt"
+  else
+    [[ "$cleanup_src" -eq 1 ]] && rm -rf "$src_dir"
+    cprof_die 1 "소스에서 build.sh+src/ 또는 dist/install.sh 를 찾을 수 없습니다: $src_dir"
+  fi
+
+  # 5. 새 버전 추출 (build.sh 우선)
+  local new_ver=""
+  new_ver="$(cprof_extract_version_from_buildsh "$src_dir/build.sh" 2>/dev/null || true)"
+
+  cprof_header "claude-profiler update"
+  cprof_kv "현재 버전"   "$CPROF_VERSION"
+  cprof_kv "새 버전"     "${new_ver:-(unknown)}"
+  cprof_kv "설치 prefix" "$prefix"
+  cprof_kv "소스"        "$src"
+  cprof_kv "모드"        "$mode"
+
+  if [[ "$opt_check" -eq 1 ]]; then
+    [[ "$cleanup_src" -eq 1 ]] && rm -rf "$src_dir"
+    if [[ -n "$new_ver" ]] && [[ "$new_ver" != "$CPROF_VERSION" ]]; then
+      cprof_info "새 버전이 가용합니다."
+      return 0
+    fi
+    cprof_info "최신 버전이거나 비교 불가."
+    return 0
+  fi
+
+  if ! cprof_confirm "업데이트를 진행하시겠습니까?" Y; then
+    [[ "$cleanup_src" -eq 1 ]] && rm -rf "$src_dir"
+    cprof_die 0 "취소됨."
+  fi
+
+  # 6. lock — 동시 실행/스위칭과 충돌 방지
+  cprof_lock_acquire || {
+    [[ "$cleanup_src" -eq 1 ]] && rm -rf "$src_dir"
+    cprof_die 4 "다른 claude-profiler 실행 중입니다."
+  }
+  # cleanup trap: lock 해제 + 임시 소스 정리
+  CPROF_UPDATE_TMP="${cleanup_src:+$src_dir}"
+  trap '
+    cprof_lock_release
+    [[ -n "${CPROF_UPDATE_TMP:-}" ]] && rm -rf "$CPROF_UPDATE_TMP"
+  ' EXIT INT TERM
+
+  # 7. 빌드 (필요 시)
+  if [[ "$mode" == "rebuild" ]]; then
+    cprof_step "빌드 중: $src_dir/build.sh"
+    if ! ( cd "$src_dir" && bash build.sh ) >/dev/null 2>&1; then
+      cprof_die 1 "build.sh 실패. 소스 디렉토리에서 직접 실행하여 원인을 확인하세요: cd $src_dir && bash build.sh"
+    fi
+  fi
+
+  # 8. 설치 (--no-shell — 셸 rc 마커는 건드리지 않음)
+  cprof_step "설치 중: $prefix"
+  if ! bash "$src_dir/dist/install.sh" --prefix "$prefix" --no-shell >/dev/null; then
+    cprof_die 1 "install.sh 실패"
+  fi
+
+  cprof_lock_release
+  CPROF_UPDATE_TMP=""
+  trap - EXIT INT TERM
+  [[ "$cleanup_src" -eq 1 ]] && rm -rf "$src_dir"
+
+  if [[ -n "$new_ver" ]]; then
+    cprof_success "업데이트 완료: $CPROF_VERSION → $new_ver"
+  else
+    cprof_success "업데이트 완료"
+  fi
+  cprof_dim "  검증: claude-profiler version"
+}
+
+# Claude Code 세션 시작/재개 시 SessionStart 훅으로 호출되는 배너.
+# stdout 이 모델 컨텍스트로 주입되므로 색상 없이 plain text 만 출력한다.
+# 미초기화/손상 상태에서는 조용히 종료하여 Claude 세션을 방해하지 않는다.
+sub_session_banner() {
+  [[ -d "$CPROF_ROOT" ]] || return 0
+  [[ -f "$CPROF_ROOT/current" ]] || return 0
+  local current
+  current="$(cprof_profile_current 2>/dev/null || true)"
+  [[ -z "$current" ]] && return 0
+
+  printf '[claude-profiler] 현재 프로파일: %s\n' "$current"
+  printf '\n프로파일 전환 (Claude Code 종료 후 새 셸에서 실행):\n'
+  printf '  claude-profiler list             # 사용 가능 프로파일 보기\n'
+  printf '  claude-profiler switch <name>    # 다른 프로파일로 전환\n'
+  printf '  claude-profiler                  # 현재 프로파일 확인\n'
+}
+
 sub_help() {
   cprof_usage
 }
@@ -1463,10 +1704,16 @@ main() {
     esac
     shift
   done
-  set -- "${positional[@]}"
+  # bash 3.2 + set -u 호환: 빈 배열 확장은 unbound로 죽으므로 가드한다 (QA-002 패턴).
+  set -- ${positional[@]+"${positional[@]}"}
 
   if [[ $# -eq 0 ]]; then
-    cprof_usage
+    # 인자 없이 호출되면 현재 활성 프로파일을 출력. 미초기화 시에는 사용법 안내.
+    if [[ -d "$CPROF_ROOT" ]] && [[ -f "$CPROF_ROOT/current" ]]; then
+      sub_current
+    else
+      cprof_usage
+    fi
     return 0
   fi
 
@@ -1483,7 +1730,9 @@ main() {
     import)    sub_import "$@" ;;
     backup)    sub_backup "$@" ;;
     uninstall) sub_uninstall "$@" ;;
+    update|self-update) sub_update "$@" ;;
     doctor)    sub_doctor "$@" ;;
+    --session-banner) sub_session_banner ;;
     version|-V|--version) sub_version ;;
     help|-h|--help) sub_help ;;
     *) cprof_die 2 "알 수 없는 명령: $cmd (도움말: claude-profiler help)" ;;

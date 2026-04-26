@@ -78,7 +78,64 @@ cprof_profile_seed_empty() {
   if [[ ! -f "$dir/_home/.claude.json" ]]; then
     printf '{}\n' >"$dir/_home/.claude.json"
   fi
+  cprof_inject_session_hook "$dir/settings.json" || true
   chmod 0700 "$dir" 2>/dev/null || true
+}
+
+# cprof_inject_session_hook <settings.json path>
+# settings.json 에 SessionStart 훅을 주입한다 (idempotent).
+# - 파일이 없거나 사실상 빈 객체({})면 우리 훅만 가진 새 파일 작성.
+# - jq 가용 + 사용자 내용 존재: jq 로 안전 병합.
+# - jq 없음 + 사용자 내용 존재: 사용자 JSON 손상 위험 → 경고 후 건너뜀.
+# 항상 0 반환 (init/seed 흐름을 깨지 않음). 실제 실패 시 경고만.
+cprof_inject_session_hook() {
+  local settings="$1"
+  local marker='claude-profiler --session-banner'
+
+  if [[ -f "$settings" ]] && grep -q "$marker" "$settings" 2>/dev/null; then
+    return 0
+  fi
+
+  local fresh
+  fresh='{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          { "type": "command", "command": "claude-profiler --session-banner" }
+        ]
+      }
+    ]
+  }
+}'
+
+  if [[ ! -s "$settings" ]] || [[ "$(tr -d '[:space:]' <"$settings")" == "{}" ]]; then
+    printf '%s\n' "$fresh" >"$settings"
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    local tmp="${settings}.cprof-tmp.$$"
+    if jq '
+      .hooks //= {}
+      | .hooks.SessionStart //= []
+      | .hooks.SessionStart += [{
+          "matcher": "startup|resume",
+          "hooks": [{ "type": "command", "command": "claude-profiler --session-banner" }]
+        }]
+    ' "$settings" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$settings"
+      return 0
+    fi
+    rm -f "$tmp"
+    cprof_warn "settings.json JSON 병합 실패 — SessionStart 훅 주입 건너뜀: $settings"
+    return 0
+  fi
+
+  cprof_warn "기존 settings.json 에 내용이 있고 jq 가 없어 SessionStart 배너 훅 주입을 건너뜁니다: $settings"
+  cprof_dim "  수동 추가 방법은 docs/USAGE.md '세션 배너' 섹션 참고."
+  return 0
 }
 
 cprof_profile_create() {
@@ -89,12 +146,15 @@ cprof_profile_create() {
     return 7
   fi
   local target_dir="$(cprof_profile_dir "$name")"
-  if [[ -n "$from" ]]; then
+  if [[ "$empty" == "1" ]]; then
+    cprof_profile_seed_empty "$name" || return 20
+  elif [[ -n "$from" ]]; then
     cprof_profile_exists "$from" || { cprof_error "원본 프로파일이 없습니다: $from"; return 3; }
     mkdir -p "$(dirname "$target_dir")"
     cprof_cp_preserve "$(cprof_profile_dir "$from")" "$target_dir" || return 20
-  elif [[ "$empty" == "1" ]] || [[ -z "$from" ]]; then
-    cprof_profile_seed_empty "$name" || return 20
+  else
+    cprof_error "내부 오류: from 또는 empty 중 하나가 지정되어야 합니다."
+    return 2
   fi
   chmod 0700 "$target_dir" 2>/dev/null || true
   return 0

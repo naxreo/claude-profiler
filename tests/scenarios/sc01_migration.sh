@@ -15,7 +15,7 @@ assert_symlink "$HOME/.claude.json"
 assert_readlink "$HOME/.claude.json" "$HOME/.claude-profiler/profiles/default/_home/.claude.json"
 
 # Settings preserved.
-assert_grep '"theme":"dark"' "$HOME/.claude/settings.json"
+assert_grep '"theme":[[:space:]]*"dark"' "$HOME/.claude/settings.json"
 assert_grep 'mcpServers' "$HOME/.claude.json"
 
 # current file equals "default".

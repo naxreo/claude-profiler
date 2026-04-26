@@ -8,7 +8,7 @@ cprof init --yes
 
 cprof create work --from default
 assert_dir "$HOME/.claude-profiler/profiles/work"
-assert_grep '"theme":"dark"' "$HOME/.claude-profiler/profiles/work/settings.json"
+assert_grep '"theme":[[:space:]]*"dark"' "$HOME/.claude-profiler/profiles/work/settings.json"
 
 cprof switch work
 assert_eq "work" "$(cprof current)"

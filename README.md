@@ -17,17 +17,21 @@ exec $SHELL    # 또는 source ~/.zshrc / ~/.bashrc
 # 첫 실행 — 기존 ~/.claude/와 ~/.claude.json을 'default' 프로파일로 마이그레이션
 claude-profiler init
 
-# 새 프로파일 만들기 (default 복제)
-claude-profiler create work --from default
+# 새 프로파일 만들기 (현재 활성 프로파일을 복제하는 게 기본)
+claude-profiler create work
 
 # 전환
 claude-profiler switch work
 
-# 현재 활성 프로파일 확인
+# 현재 활성 프로파일 확인 (인자 없이 호출해도 동일)
 claude-profiler current
+claude-profiler
 
 # 깨끗한 환경 (없으면 자동 생성)
 claude-profiler switch vanilla
+
+# 클린 슬레이트로 새 프로파일 (Claude Code 재인증 필요)
+claude-profiler create personal --empty
 ```
 
 ## 명령
@@ -36,15 +40,16 @@ claude-profiler switch vanilla
 |------|------|
 | `init` | 첫 실행 마이그레이션 + 통합 git 저장소 초기화 |
 | `list` | 프로파일 목록 (활성에 `*`) |
-| `current` | 현재 활성 프로파일 이름 |
+| `current` | 현재 활성 프로파일 이름 (인자 없이 `claude-profiler` 만 입력해도 동일) |
 | `switch <name>` | 전환. `vanilla`는 미존재 시 자동 생성 |
-| `create <name> [--from <src>] [--empty]` | 빈/복제 프로파일 |
+| `create <name> [--from <src> \| --empty]` | 기본은 현재 프로파일 복제. `--from`으로 다른 원본, `--empty`로 클린 슬레이트(재인증 필요) |
 | `delete <name>` | 비활성 프로파일 삭제 (자동 백업) |
 | `rename <old> <new>` | 이름 변경 |
 | `export <name> <path.tgz>` | 프로파일 내보내기 |
 | `import <path.tgz> [--name <new>]` | 프로파일 가져오기 |
 | `backup list/prune/restore` | 백업 관리 |
 | `uninstall` | 도구 제거 (자세한 옵션은 `docs/USAGE.md`) |
+| `update [--from <url\|path>] [--ref <ref>] [--check]` | 설치된 바이너리를 새 버전으로 갱신 (사용자 데이터/셸 rc 보존) |
 | `doctor` | 일관성 진단 |
 
 ## 동작 방식
@@ -55,6 +60,10 @@ claude-profiler switch vanilla
 ```
 
 `switch` 한 번에 두 심볼릭 링크가 갱신됩니다. Claude Code 입장에서는 평소처럼 `~/.claude/` 와 `~/.claude.json`을 사용하지만, 그 실체는 활성 프로파일에 따라 바뀝니다.
+
+## 세션 배너
+
+`init` 후 모든 프로파일에 SessionStart 훅이 자동 등록되어, `claude` 가 시작/재개될 때마다 컨텍스트 첫머리에 현재 프로파일 이름과 전환 안내가 표시됩니다. 빈 프로파일(`--empty`/`vanilla`)에도 동일하게 적용됩니다. 비활성화/커스터마이징은 `docs/USAGE.md` 의 [세션 배너 섹션](docs/USAGE.md#세션-배너-sessionstart-훅) 참고.
 
 ## 데이터 안전성
 
