@@ -1,0 +1,55 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Test artifacts
+tests/tmp/
+tests/.tmp/
+*.test.log
+
+# Local env
+.env
+.env.local
+
+# Project-specific
+_workspace/
+
+# LLM / AI assistants
+CLAUDE.md
+.CLAUDE.md
+CLAUDE.local.md
+.claude/
+.anthropic/
+GEMINI.md
+.gemini/
+AGENTS.md
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.continue/
+.windsurfrules
+.windsurf/
+.codeium/
+.cline/
+.clinerules
+.roo/
+.roomodes
+.specstory/
+.ai/
+.github/copilot-instructions.md

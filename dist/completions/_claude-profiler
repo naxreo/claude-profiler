@@ -1,0 +1,78 @@
+#compdef claude-profiler
+# zsh completion for claude-profiler
+
+_claude_profiler() {
+  local -a commands
+  commands=(
+    'init:첫 실행 마이그레이션'
+    'list:프로파일 목록'
+    'current:현재 활성 프로파일'
+    'switch:프로파일 전환'
+    'create:새 프로파일 생성'
+    'delete:프로파일 삭제'
+    'rename:이름 변경'
+    'export:tarball로 내보내기'
+    'import:tarball에서 가져오기'
+    'backup:백업 관리'
+    'uninstall:도구 제거'
+    'doctor:일관성 진단'
+    'version:버전'
+    'help:도움말'
+  )
+
+  _profiles() {
+    local -a names
+    names=(${(f)"$(claude-profiler list --quiet 2>/dev/null)"})
+    _describe 'profile' names
+  }
+
+  _arguments -C \
+    '1: :->cmd' \
+    '*::arg:->args'
+
+  case $state in
+    cmd)
+      _describe 'command' commands
+      ;;
+    args)
+      case $words[1] in
+        switch|use|delete|rm|rename|mv|export)
+          _profiles
+          ;;
+        create|new)
+          _arguments \
+            '--from[복제 원본]:profile:_profiles' \
+            '--empty[빈 프로파일]'
+          ;;
+        backup)
+          local -a sub
+          sub=('list:백업 목록' 'prune:정리' 'restore:추출')
+          _describe 'backup action' sub
+          ;;
+        init)
+          _arguments \
+            '--yes[자동 동의]' \
+            '--no-git[git 비활성]'
+          ;;
+        uninstall)
+          _arguments \
+            '--restore[지정 프로파일 복원]:profile:_profiles' \
+            '--restore-origin[원본 백업으로 원복]:tgz file:_files -g "*.tgz"' \
+            '--keep-data[데이터 보존]' \
+            '--archive-others[다른 프로파일 보관]' \
+            '--discard-others[다른 프로파일 삭제]' \
+            '--keep-others[다른 프로파일 그대로]' \
+            '--yes[자동 동의]' \
+            '--force[활성 세션 검사 우회]'
+          ;;
+        import)
+          _arguments \
+            '*:tgz file:_files -g "*.tgz"' \
+            '--name[새 이름]:name:'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_claude_profiler "$@"

@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+# claude-profiler — main entry point.
+# When developed as modules: source ./lib/*.sh first.
+# When built (dist/claude-profiler): all libs are inlined above this section.
+
+set -Eeuo pipefail
+
+CPROF_VERSION="${CPROF_VERSION:-0.1.0-dev}"
+CPROF_ROOT="${CPROF_ROOT:-$HOME/.claude-profiler}"
+CPROF_FLAG_YES="${CPROF_FLAG_YES:-0}"
+
+# Dev mode: source lib files if they exist alongside this script.
+if [[ -z "${CPROF_BUILT:-}" ]]; then
+  __cprof_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -d "$__cprof_self_dir/lib" ]]; then
+    # shellcheck source=lib/platform.sh
+    source "$__cprof_self_dir/lib/platform.sh"
+    source "$__cprof_self_dir/lib/ui.sh"
+    source "$__cprof_self_dir/lib/profile.sh"
+    source "$__cprof_self_dir/lib/backup.sh"
+    source "$__cprof_self_dir/lib/git.sh"
+    source "$__cprof_self_dir/lib/switch.sh"
+  fi
+fi
+
+# ---- Helpers ----
+
+cprof_usage() {
+  cat <<EOF
+claude-profiler — Claude Code 프로파일 관리 도구 (v$CPROF_VERSION)
+
+사용법:
+  claude-profiler <command> [options]
+
+명령:
+  init                    첫 실행. 기존 ~/.claude/와 ~/.claude.json을 default 프로파일로 마이그레이션.
+  list                    프로파일 목록 출력 (활성에 * 표시)
+  current                 현재 활성 프로파일 이름 출력
+  switch <name>           프로파일 전환. <name>=vanilla 이고 미존재 시 자동 생성.
+  create <name>           새 프로파일 생성. --from <src>로 복제, --empty로 빈 프로파일.
+  delete <name>           프로파일 삭제 (활성은 거부). 자동 백업.
+  rename <old> <new>      이름 변경.
+  export <name> <path>    프로파일을 tarball로 내보내기.
+  import <path>           tarball에서 프로파일 가져오기. --name <new>로 이름 지정.
+  backup list             백업 목록 보기.
+  backup prune [--older-than <days>]  오래된 백업 정리.
+  backup restore <name>   특정 백업을 임시 위치에 추출.
+  uninstall               도구 제거 (옵션은 USAGE 참고).
+  doctor                  설정 일관성 검사.
+  version                 버전 출력.
+  help                    이 도움말.
+
+전역 옵션:
+  --yes, -y               확인 프롬프트 자동 동의
+  --no-color              색상 출력 끄기
+  --force                 위험 검사(활성 세션 등) 우회
+
+자세한 내용: claude-profiler help <command>
+EOF
+}
+
+cprof_state_diagnose() {
+  if [[ ! -d "$CPROF_ROOT" ]]; then
+    printf 'unconfigured\n'; return
+  fi
+  if [[ ! -f "$CPROF_ROOT/current" ]]; then
+    printf 'corrupted-current\n'; return
+  fi
+  local current
+  current="$(cprof_profile_current)"
+  if [[ -z "$current" ]] || ! cprof_profile_exists "$current"; then
+    printf 'corrupted-current\n'; return
+  fi
+  if [[ ! -L "$HOME/.claude" ]] || [[ ! -L "$HOME/.claude.json" ]]; then
+    printf 'corrupted-link\n'; return
+  fi
+  if cprof_verify_links "$current"; then
+    printf 'active\n'
+  else
+    printf 'corrupted-link\n'
+  fi
+}
+
+cprof_require_initialized() {
+  local state="$(cprof_state_diagnose)"
+  case "$state" in
+    active) return 0 ;;
+    unconfigured) cprof_die 1 "claude-profiler가 초기화되지 않았습니다. 먼저: claude-profiler init" ;;
+    corrupted-current|corrupted-link)
+      cprof_die 30 "설정 일관성이 깨졌습니다. 진단: claude-profiler doctor"
+      ;;
+  esac
+}
+
+# ---- Subcommands ----
+
+sub_init() {
+  local opt_yes=0 opt_no_git=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) opt_yes=1 ;;
+      --no-git) opt_no_git=1 ;;
+      *) cprof_die 2 "알 수 없는 옵션: $1" ;;
+    esac
+    shift
+  done
+  [[ "$opt_yes" -eq 1 ]] && CPROF_FLAG_YES=1
+
+  if [[ -d "$CPROF_ROOT" ]]; then
+    cprof_die 1 "이미 초기화되어 있습니다: $CPROF_ROOT"
+  fi
+  if [[ -L "$HOME/.claude" ]]; then
+    cprof_die 1 "~/.claude 가 이미 심볼릭 링크입니다. 다른 도구가 관리 중인 것 같습니다."
+  fi
+  if [[ -L "$HOME/.claude.json" ]]; then
+    cprof_die 1 "~/.claude.json 이 이미 심볼릭 링크입니다. 다른 도구가 관리 중인 것 같습니다."
+  fi
+
+  local has_existing_claude=0 has_existing_json=0 has_existing_git=0 origin_url=""
+  [[ -d "$HOME/.claude" ]] && has_existing_claude=1
+  [[ -f "$HOME/.claude.json" ]] && has_existing_json=1
+  if [[ "$has_existing_claude" -eq 1 ]] && [[ -d "$HOME/.claude/.git" || -f "$HOME/.claude/.git" ]]; then
+    has_existing_git=1
+    origin_url="$(cprof_git_extract_origin "$HOME/.claude")"
+  fi
+
+  cprof_header "claude-profiler init"
+  cprof_kv "도구 디렉토리"      "$CPROF_ROOT"
+  cprof_kv "활성 프로파일"      "default"
+  cprof_kv "기존 ~/.claude/"    "$([ "$has_existing_claude" = 1 ] && echo '존재 → default 프로파일로 이동' || echo '없음 → 빈 default 생성')"
+  cprof_kv "기존 ~/.claude.json" "$([ "$has_existing_json" = 1 ] && echo '존재 → default/_home/ 으로 이동' || echo '없음 → 빈 파일 생성')"
+  if [[ "$has_existing_git" -eq 1 ]]; then
+    cprof_kv "기존 .git/"        "감지됨 → 통합 저장소로 변환 (이력은 백업 tgz에만 보존)"
+    [[ -n "$origin_url" ]] && cprof_kv "기존 origin URL"  "$origin_url"
+  fi
+  if cprof_have_git && [[ "$opt_no_git" -eq 0 ]]; then
+    cprof_kv "통합 git 저장소"   "$CPROF_ROOT/.git (새로 초기화)"
+  else
+    cprof_kv "통합 git 저장소"   "비활성화 (git 미설치 또는 --no-git)"
+  fi
+
+  if ! cprof_confirm "계속하시겠습니까?" N; then
+    cprof_die 0 "취소됨."
+  fi
+
+  mkdir -p "$CPROF_ROOT/profiles" "$CPROF_ROOT/backup"
+  chmod 0700 "$CPROF_ROOT" 2>/dev/null || true
+
+  local backup_path=""
+  if [[ "$has_existing_claude" -eq 1 ]] || [[ "$has_existing_json" -eq 1 ]]; then
+    cprof_step "원본 백업 생성 중..."
+    backup_path="$(cprof_backup_create_origin)" || cprof_die 21 "백업 실패 (디스크 공간을 확인하세요)"
+    [[ -s "$backup_path" ]] || cprof_die 21 "백업 파일이 비어있습니다: $backup_path"
+  fi
+
+  local default_dir="$CPROF_ROOT/profiles/default"
+  mkdir -p "$default_dir/_home"
+
+  if [[ "$has_existing_claude" -eq 1 ]]; then
+    cprof_step "~/.claude 를 default 프로파일로 이동 중..."
+    rmdir "$default_dir/_home" 2>/dev/null || true
+    rmdir "$default_dir" 2>/dev/null || true
+    if ! mv "$HOME/.claude" "$default_dir"; then
+      cprof_die 10 "마이그레이션 실패. 복원: tar -xzf $backup_path -C \$HOME"
+    fi
+    rm -rf "$default_dir/.git"
+    mkdir -p "$default_dir/_home"
+  else
+    cprof_profile_seed_empty default
+  fi
+
+  if [[ "$has_existing_json" -eq 1 ]]; then
+    cprof_step "~/.claude.json 을 default/_home/ 으로 이동 중..."
+    if ! mv "$HOME/.claude.json" "$default_dir/_home/.claude.json"; then
+      cprof_die 10 "마이그레이션 실패. 복원: tar -xzf $backup_path -C \$HOME"
+    fi
+  else
+    [[ -f "$default_dir/_home/.claude.json" ]] || printf '{}\n' >"$default_dir/_home/.claude.json"
+  fi
+
+  ln -s "$default_dir"                          "$HOME/.claude"
+  ln -s "$default_dir/_home/.claude.json"       "$HOME/.claude.json"
+
+  cprof_atomic_write "default" "$CPROF_ROOT/current"
+
+  if cprof_have_git && [[ "$opt_no_git" -eq 0 ]]; then
+    cprof_step "통합 git 저장소 초기화 중..."
+    if ! cprof_git_init_unified "$CPROF_ROOT"; then
+      cprof_warn "git 저장소 초기화 실패. 도구는 정상 동작하지만 통합 백업은 비활성 상태입니다."
+    fi
+  else
+    cprof_git_write_gitignore "$CPROF_ROOT"
+  fi
+
+  printf '{"version":"%s","createdAt":"%s"}\n' "$CPROF_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$CPROF_ROOT/config.json"
+
+  cprof_success "default 프로파일 생성됨"
+  cprof_success "~/.claude → $default_dir"
+  cprof_success "~/.claude.json → $default_dir/_home/.claude.json"
+  if [[ -n "$backup_path" ]]; then
+    cprof_success "원본 백업: $backup_path"
+  fi
+  cprof_git_post_init_hint "$origin_url"
+}
+
+sub_list() {
+  cprof_require_initialized
+  local opt_quiet=0 opt_json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --quiet|-q) opt_quiet=1 ;;
+      --json) opt_json=1 ;;
+      *) cprof_die 2 "알 수 없는 옵션: $1" ;;
+    esac
+    shift
+  done
+  local current
+  current="$(cprof_profile_current)"
+  local profiles
+  profiles="$(cprof_profile_list)"
+  if [[ "$opt_quiet" -eq 1 ]]; then
+    printf '%s\n' "$profiles"
+    return 0
+  fi
+  if [[ "$opt_json" -eq 1 ]]; then
+    local first=1
+    printf '{"current":"%s","profiles":[' "$current"
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      [[ "$first" -eq 0 ]] && printf ','
+      printf '"%s"' "$p"
+      first=0
+    done <<<"$profiles"
+    printf ']}\n'
+    return 0
+  fi
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    if [[ "$p" == "$current" ]]; then
+      printf '%s* %s%s%s%s\n' "$CPROF_C_GREEN" "$CPROF_C_BOLD" "$p" "$CPROF_C_RESET" ''
+    else
+      printf '  %s\n' "$p"
+    fi
+  done <<<"$profiles"
+}
+
+sub_current() {
+  cprof_require_initialized
+  local opt_quiet=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --quiet|-q) opt_quiet=1 ;;
+      *) cprof_die 2 "알 수 없는 옵션: $1" ;;
+    esac
+    shift
+  done
+  cprof_profile_current
+}
+
+sub_switch() {
+  cprof_require_initialized
+  local target="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      -*) cprof_die 2 "알 수 없는 옵션: $1" ;;
+      *) [[ -z "$target" ]] && target="$1" || cprof_die 2 "인자가 너무 많습니다: $1" ;;
+    esac
+    shift
+  done
+  [[ -z "$target" ]] && cprof_die 2 "사용법: claude-profiler switch <name>"
+  cprof_switch_to "$target" "$force"
+}
+
+sub_create() {
+  cprof_require_initialized
+  local name="" from="" empty=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) from="$2"; shift ;;
+      --empty) empty=1 ;;
+      -*) cprof_die 2 "알 수 없는 옵션: $1" ;;
+      *) [[ -z "$name" ]] && name="$1" || cprof_die 2 "인자가 너무 많습니다: $1" ;;
+    esac
+    shift
+  done
+  [[ -z "$name" ]] && cprof_die 2 "사용법: claude-profiler create <name> [--from <src>] [--empty]"
+  cprof_profile_create "$name" "$from" "$empty"
+  cprof_success "프로파일 생성됨: $name"
+}
+
+sub_delete() {
+  cprof_require_initialized
+  local name="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      --yes|-y) CPROF_FLAG_YES=1 ;;
+      -*) cprof_die 2 "알 수 없는 옵션: $1" ;;
+      *) [[ -z "$name" ]] && name="$1" || cprof_die 2 "인자가 너무 많습니다: $1" ;;
+    esac
+    shift
+  done
+  [[ -z "$name" ]] && cprof_die 2 "사용법: claude-profiler delete <name>"
+  cprof_profile_validate_name "$name" use || exit $?
+  cprof_profile_exists "$name" || cprof_die 3 "프로파일이 없습니다: $name"
+  if ! cprof_confirm "프로파일 '$name' 삭제 (자동 백업 후)?" N; then
+    cprof_die 0 "취소됨."
+  fi
+  cprof_lock_acquire || cprof_die 4 "다른 claude-profiler 실행 중입니다."
+  trap 'cprof_lock_release' EXIT INT TERM
+  cprof_check_no_active_claude "$force" || exit 5
+  local backup_path
+  backup_path="$(cprof_backup_create_profile "$name" delete)" || cprof_die 21 "백업 실패"
+  cprof_profile_delete "$name" || exit $?
+  cprof_lock_release
+  trap - EXIT INT TERM
+  cprof_success "프로파일 삭제됨: $name"
+  cprof_dim "백업: $backup_path"
+}
+
+sub_rename() {
+  cprof_require_initialized
+  local old="" new=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) cprof_die 2 "알 수 없는 옵션: $1" ;;
+      *)
+        if [[ -z "$old" ]]; then old="$1"
+        elif [[ -z "$new" ]]; then new="$1"
+        else cprof_die 2 "인자가 너무 많습니다: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [[ -z "$old" || -z "$new" ]] && cprof_die 2 "사용법: claude-profiler rename <old> <new>"
+  cprof_lock_acquire || cprof_die 4 "다른 claude-profiler 실행 중입니다."
+  trap 'cprof_lock_release' EXIT INT TERM
+  cprof_backup_state rename "old=$old" "new=$new" >/dev/null
+  cprof_profile_rename "$old" "$new" || exit $?
+  cprof_lock_release
+  trap - EXIT INT TERM
+  cprof_success "이름 변경: $old → $new"
+}
+
+sub_export() {
+  cprof_require_initialized
+  local name="" out="" exclude_cache=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --exclude-cache) exclude_cache=1 ;;
+      -*) cprof_die 2 "알 수 없는 옵션: $1" ;;
+      *)
+        if [[ -z "$name" ]]; then name="$1"
+        elif [[ -z "$out" ]]; then out="$1"
+        else cprof_die 2 "인자가 너무 많습니다: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [[ -z "$name" || -z "$out" ]] && cprof_die 2 "사용법: claude-profiler export <name> <path.tgz>"
+  cprof_profile_exists "$name" || cprof_die 3 "프로파일이 없습니다: $name"
+  local profiles="$CPROF_ROOT/profiles"
+  local exclude_args=()
+  if [[ "$exclude_cache" -eq 1 ]]; then
+    exclude_args=(
+      --exclude="$name/cache"
+      --exclude="$name/image-cache"
+      --exclude="$name/paste-cache"
+      --exclude="$name/shell-snapshots"
+      --exclude="$name/session-env"
+      --exclude="$name/telemetry"
+      --exclude="$name/statsig"
+      --exclude="$name/debug"
+      --exclude="$name/ide"
+      --exclude="$name/downloads"
+    )
+  fi
+  if ! tar -czf "$out" -C "$profiles" ${exclude_args[@]+"${exclude_args[@]}"} "$name" 2>/dev/null; then
+    cprof_die 21 "내보내기 실패: $out"
+  fi
+  cprof_success "내보냄: $out"
+}
+
+sub_import() {
+  cprof_require_initialized
+  local path="" new_name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) new_name="$2"; shift ;;
+      -*) cprof_die 2 "알 수 없는 옵션: $1" ;;
+      *) [[ -z "$path" ]] && path="$1" || cprof_die 2 "인자가 너무 많습니다: $1" ;;
+    esac
+    shift
+  done
+  [[ -z "$path" ]] && cprof_die 2 "사용법: claude-profiler import <path.tgz> [--name <new>]"
+  [[ -f "$path" ]] || cprof_die 3 "파일이 없습니다: $path"
+  cprof_backup_validate_tar_safe "$path" || cprof_die 2 "백업 파일이 안전하지 않습니다 (절대 경로 또는 ../)"
+  cprof_lock_acquire || cprof_die 4 "다른 claude-profiler 실행 중입니다."
+  trap 'cprof_lock_release' EXIT INT TERM
+
+  local tmp
+  tmp="$(cprof_mktempd cprof-import)"
+  if ! tar -xzf "$path" -C "$tmp"; then
+    rm -rf "$tmp"
+    cprof_die 21 "추출 실패: $path"
+  fi
+  local entries
+  entries="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d)"
+  local count
+  count="$(printf '%s\n' "$entries" | grep -c . || true)"
+  if [[ "$count" -ne 1 ]]; then
+    rm -rf "$tmp"
+    cprof_die 2 "tarball에 정확히 하나의 프로파일 디렉토리가 있어야 합니다 (발견: $count)"
+  fi
+  local extracted_name
+  extracted_name="$(basename "$entries")"
+  local final_name="${new_name:-$extracted_name}"
+  cprof_profile_validate_name "$final_name" || { rm -rf "$tmp"; exit $?; }
+  if cprof_profile_exists "$final_name"; then
+    rm -rf "$tmp"
+    cprof_die 7 "프로파일이 이미 존재합니다: $final_name (--name 으로 다른 이름 지정)"
+  fi
+  cprof_backup_state import "source=$path" "target_name=$final_name" >/dev/null
+  mv "$tmp/$extracted_name" "$CPROF_ROOT/profiles/$final_name"
+  rm -rf "$tmp"
+  cprof_lock_release
+  trap - EXIT INT TERM
+  cprof_success "가져옴: $final_name"
+}
+
+sub_backup() {
+  cprof_require_initialized
+  local action="${1:-list}"; [[ $# -gt 0 ]] && shift
+  case "$action" in
+    list)
+      local rows
+      rows="$(cprof_backup_list)"
+      if [[ -z "$rows" ]]; then
+        cprof_dim "(백업 없음)"
+        return 0
+      fi
+      printf '%-20s  %12s  %s\n' "수정시각" "크기(B)" "이름"
+      printf '%-20s  %12s  %s\n' '-------------------' '-----------' '----'
+      printf '%s\n' "$rows" | sort -r | awk -F'\t' '{ printf "%-20s  %12s  %s\n", $1, $2, $3 }'
+      local old
+      old="$(cprof_backup_count_old 30)"
+      [[ "$old" -gt 0 ]] && cprof_warn "30일 이상 된 백업이 ${old}개 있습니다. 정리: claude-profiler backup prune"
+      ;;
+    prune)
+      local days=30
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --older-than) days="$2"; shift ;;
+          *) cprof_die 2 "알 수 없는 옵션: $1" ;;
+        esac
+        shift
+      done
+      local count
+      count="$(cprof_backup_count_old "$days")"
+      [[ "$count" -eq 0 ]] && { cprof_info "정리할 백업이 없습니다."; return 0; }
+      if cprof_confirm "${days}일 이상 된 백업 ${count}개를 삭제하시겠습니까?" N; then
+        local removed
+        removed="$(cprof_backup_prune "$days")"
+        cprof_success "${removed}개 삭제됨."
+      fi
+      ;;
+    restore)
+      local name="${1:-}"
+      [[ -z "$name" ]] && cprof_die 2 "사용법: claude-profiler backup restore <backup-filename>"
+      local f="$(cprof_backup_dir)/$name"
+      [[ -f "$f" ]] || cprof_die 3 "백업이 없습니다: $name"
+      cprof_backup_validate_tar_safe "$f" || cprof_die 2 "백업이 안전하지 않습니다."
+      local tmp
+      tmp="$(cprof_mktempd cprof-restore)"
+      tar -xzf "$f" -C "$tmp" || { rm -rf "$tmp"; cprof_die 21 "추출 실패"; }
+      cprof_success "추출됨: $tmp"
+      cprof_dim "복원 위치는 사용자가 결정하세요."
+      ;;
+    *)
+      cprof_die 2 "알 수 없는 backup 액션: $action (list|prune|restore)"
+      ;;
+  esac
+}
+
+sub_doctor() {
+  local state
+  state="$(cprof_state_diagnose)"
+  cprof_header "진단 결과"
+  cprof_kv "상태" "$state"
+  cprof_kv "도구 디렉토리" "$CPROF_ROOT"
+  case "$state" in
+    active)
+      cprof_kv "활성 프로파일" "$(cprof_profile_current)"
+      cprof_kv "~/.claude → " "$(readlink "$HOME/.claude" 2>/dev/null)"
+      cprof_kv "~/.claude.json → " "$(readlink "$HOME/.claude.json" 2>/dev/null)"
+      cprof_success "정상"
+      ;;
+    unconfigured)
+      cprof_warn "초기화되지 않았습니다. claude-profiler init 으로 시작하세요."
+      ;;
+    corrupted-current)
+      cprof_error "current 파일이 손상되었거나 가리키는 프로파일이 없습니다."
+      cprof_info "복구: 사용 가능 프로파일 중 하나로 current를 직접 갱신하거나, backup/origin-*.tgz 로 복원."
+      ;;
+    corrupted-link)
+      cprof_error "심볼릭 링크가 깨졌습니다."
+      cprof_info "복구: claude-profiler switch <name> 로 재설정 시도."
+      ;;
+  esac
+}
+
+sub_uninstall() {
+  cprof_require_initialized
+  local mode="default" restore_target="" restore_origin_path="" keep_data=0
+  local archive_others=1 discard_others=0 keep_others=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --restore) mode="restore"; restore_target="$2"; shift ;;
+      --restore-origin) mode="restore-origin"; [[ "${2:-}" =~ ^- ]] || { restore_origin_path="${2:-}"; [[ -n "${2:-}" ]] && shift; } ;;
+      --keep-data) keep_data=1 ;;
+      --archive-others) archive_others=1; discard_others=0; keep_others=0 ;;
+      --discard-others) discard_others=1; archive_others=0; keep_others=0 ;;
+      --keep-others) keep_others=1; archive_others=0; discard_others=0 ;;
+      --yes|-y) CPROF_FLAG_YES=1 ;;
+      --force) CPROF_FLAG_FORCE=1 ;;
+      *) cprof_die 2 "알 수 없는 옵션: $1" ;;
+    esac
+    shift
+  done
+
+  cprof_lock_acquire || cprof_die 4 "다른 claude-profiler 실행 중입니다."
+  trap 'cprof_lock_release' EXIT INT TERM
+  cprof_check_no_active_claude "${CPROF_FLAG_FORCE:-0}" || exit 5
+
+  if [[ "$mode" == "restore" ]]; then
+    [[ -z "$restore_target" ]] && cprof_die 2 "사용법: claude-profiler uninstall --restore <name>"
+    cprof_profile_exists "$restore_target" || cprof_die 3 "프로파일이 없습니다: $restore_target"
+    if [[ "$(cprof_profile_current)" != "$restore_target" ]]; then
+      cprof_step "활성 프로파일을 '$restore_target' 으로 전환 후 진행합니다."
+      cprof_lock_release; trap - EXIT INT TERM
+      cprof_switch_to "$restore_target" "${CPROF_FLAG_FORCE:-0}" || exit $?
+      cprof_lock_acquire || cprof_die 4 "lock 재획득 실패"
+      trap 'cprof_lock_release' EXIT INT TERM
+    fi
+  fi
+
+  local ts="$(date +%Y%m%d-%H%M%S)"
+  local snapshot="$HOME/uninstall-snapshot-${ts}.tgz"
+  cprof_step "외부 안전망 스냅샷 생성: $snapshot"
+  local snap_sources=()
+  [[ -e "$HOME/.claude" ]] && snap_sources+=(.claude)
+  [[ -e "$HOME/.claude.json" ]] && snap_sources+=(.claude.json)
+  if [[ "${#snap_sources[@]}" -gt 0 ]]; then
+    tar -czhf "$snapshot" -C "$HOME" "${snap_sources[@]}" 2>/dev/null || cprof_die 21 "스냅샷 생성 실패"
+  fi
+
+  local current
+  current="$(cprof_profile_current)"
+
+  case "$mode" in
+    default|restore)
+      local archive_path=""
+      if [[ "$archive_others" -eq 1 ]]; then
+        archive_path="$HOME/claude-profiles-archive-${ts}.tgz"
+        local others=()
+        local p
+        while IFS= read -r p; do
+          [[ -z "$p" ]] && continue
+          [[ "$p" == "$current" ]] && continue
+          others+=("$p")
+        done < <(cprof_profile_list)
+        if [[ "${#others[@]}" -gt 0 ]]; then
+          cprof_step "다른 프로파일 보관: $archive_path"
+          tar -czf "$archive_path" -C "$CPROF_ROOT/profiles" "${others[@]}" 2>/dev/null \
+            || cprof_die 21 "다른 프로파일 보관 실패"
+        else
+          archive_path=""
+        fi
+      fi
+
+      cprof_step "활성 프로파일을 ~/.claude/ 로 복원..."
+      rm -f "$HOME/.claude"
+      mv "$CPROF_ROOT/profiles/$current" "$HOME/.claude" || cprof_die 11 "복원 실패"
+      rm -f "$HOME/.claude.json"
+      mv "$HOME/.claude/_home/.claude.json" "$HOME/.claude.json" || cprof_die 11 "복원 실패"
+      rmdir "$HOME/.claude/_home" 2>/dev/null || true
+
+      if [[ "$keep_data" -eq 0 ]]; then
+        cprof_step "도구 디렉토리 제거: $CPROF_ROOT"
+        rm -rf "$CPROF_ROOT"
+      else
+        cprof_warn "--keep-data: $CPROF_ROOT 보존됨. 다음 셸에서 동작하지 않으므로 수동 정리 또는 재설치가 필요합니다."
+      fi
+
+      cprof_lock_release; trap - EXIT INT TERM
+      cprof_success "uninstall 완료 (모드: $mode)"
+      cprof_kv "복원된 프로파일" "$current"
+      cprof_kv "스냅샷" "$snapshot"
+      [[ -n "$archive_path" ]] && cprof_kv "다른 프로파일 보관" "$archive_path"
+      cprof_info ""
+      cprof_dim "복원이 잘못되었다면: tar -xzf $snapshot -C \$HOME"
+      ;;
+
+    restore-origin)
+      if [[ -z "$restore_origin_path" ]]; then
+        restore_origin_path="$(cprof_backup_find_oldest_origin)"
+      fi
+      [[ -n "$restore_origin_path" && -f "$restore_origin_path" ]] \
+        || cprof_die 3 "origin 백업이 없습니다. 명시적으로 경로를 지정하세요: --restore-origin <tgz>"
+      cprof_backup_validate_tar_safe "$restore_origin_path" \
+        || cprof_die 2 "백업이 안전하지 않습니다 (절대 경로 또는 ../)"
+
+      cprof_step "origin 백업을 외부로 복사: $restore_origin_path"
+      local copied="$HOME/restored-from-${ts}.tgz"
+      cp "$restore_origin_path" "$copied" || cprof_die 21 "복사 실패"
+
+      if ! cprof_confirm "원복 진행: ~/.claude/ ~/.claude.json 모두 사라지고 위 백업 내용으로 교체됩니다." N; then
+        cprof_die 0 "취소됨. (스냅샷 보관: $snapshot, 복사본: $copied)"
+      fi
+
+      rm -f "$HOME/.claude" "$HOME/.claude.json"
+      rm -rf "$CPROF_ROOT"
+
+      tar -xzf "$copied" -C "$HOME" || cprof_die 21 "복원 실패"
+
+      cprof_lock_release; trap - EXIT INT TERM
+      cprof_success "원복 완료"
+      cprof_kv "사용한 백업" "$(basename "$restore_origin_path")"
+      cprof_kv "스냅샷" "$snapshot"
+      cprof_kv "복사본" "$copied"
+      ;;
+  esac
+}
+
+sub_version() {
+  printf 'claude-profiler %s\n' "$CPROF_VERSION"
+}
+
+sub_help() {
+  cprof_usage
+}
+
+# ---- Main dispatcher ----
+
+main() {
+  cprof_color_init auto
+
+  local args=() positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-color) cprof_color_init off ;;
+      --color) cprof_color_init on ;;
+      --yes|-y) CPROF_FLAG_YES=1 ;;
+      --version|-V) sub_version; return 0 ;;
+      -h|--help) sub_help; return 0 ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  set -- "${positional[@]}"
+
+  if [[ $# -eq 0 ]]; then
+    cprof_usage
+    return 0
+  fi
+
+  local cmd="$1"; shift
+  case "$cmd" in
+    init)      sub_init "$@" ;;
+    list|ls)   sub_list "$@" ;;
+    current)   sub_current "$@" ;;
+    switch|use)sub_switch "$@" ;;
+    create|new)sub_create "$@" ;;
+    delete|rm) sub_delete "$@" ;;
+    rename|mv) sub_rename "$@" ;;
+    export)    sub_export "$@" ;;
+    import)    sub_import "$@" ;;
+    backup)    sub_backup "$@" ;;
+    uninstall) sub_uninstall "$@" ;;
+    doctor)    sub_doctor "$@" ;;
+    version|-V|--version) sub_version ;;
+    help|-h|--help) sub_help ;;
+    *) cprof_die 2 "알 수 없는 명령: $cmd (도움말: claude-profiler help)" ;;
+  esac
+}
+
+main "$@"
