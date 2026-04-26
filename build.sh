@@ -57,5 +57,7 @@ mkdir -p "$DIST/completions"
 cp "$SRC/completions/"* "$DIST/completions/" 2>/dev/null || true
 cp "$SRC/install.sh" "$DIST/install.sh" 2>/dev/null || true
 [[ -f "$DIST/install.sh" ]] && chmod +x "$DIST/install.sh"
+cp "$SRC/bootstrap-update.sh" "$DIST/bootstrap-update.sh" 2>/dev/null || true
+[[ -f "$DIST/bootstrap-update.sh" ]] && chmod +x "$DIST/bootstrap-update.sh"
 
 echo "Built $OUT (version $VERSION, $(wc -l <"$OUT" | tr -d ' ') lines)"

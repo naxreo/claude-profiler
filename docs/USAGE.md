@@ -221,9 +221,25 @@ claude-profiler update [--from <git-url|local-path>] [--ref <branch|tag>] [--che
 
 1. `--from <url-or-path>` — 명시적 지정 (가장 우선).
 2. 환경 변수 `CPROF_UPDATE_URL` — 셸 rc 또는 CI 환경에서 고정해두고 사용.
-3. 둘 다 없으면 에러로 종료 (코드 2).
+3. **빌트인 기본값** — `https://github.com/naxreo/claude-profiler.git` (공식 GitHub 저장소).
+
+따라서 **옵션 없이** `claude-profiler update --yes` 만으로도 공식 저장소에서 갱신이 가능합니다. 출력의 `소스` 라인에 어떤 출처(`옵션`/`환경변수`/`기본값`)가 사용됐는지 표시됩니다.
 
 소스가 **로컬 디렉토리**면 그대로 사용하고, **URL**(git 저장소)이면 `git clone --depth 1` 으로 임시 디렉토리에 가져온 뒤 빌드합니다. `--ref` 로 브랜치 또는 태그를 지정할 수 있습니다.
+
+### 포크 / 미러 사용자
+
+공식 저장소가 아닌 포크나 사내 미러에서 받은 빌드를 쓰는 경우, 기본값이 자동으로 upstream 을 가리키므로 **명시적 오버라이드를 권장**합니다.
+
+```bash
+# 셸 rc 에 한 번만 등록
+export CPROF_UPDATE_URL="https://example.org/your-fork.git"
+
+# 또는 매 호출마다
+claude-profiler update --from https://example.org/your-fork.git --yes
+```
+
+배포자는 빌드 시 `CPROF_DEFAULT_UPDATE_URL=<url> bash build.sh` 로 빌트인 기본값 자체를 바꿀 수도 있습니다.
 
 ### 소스 형태 자동 감지
 
@@ -252,19 +268,22 @@ claude-profiler update [--from <git-url|local-path>] [--ref <branch|tag>] [--che
 ### 예
 
 ```bash
+# 가장 간단한 형태 — 빌트인 기본값(공식 GitHub 저장소) 사용
+claude-profiler update --check       # 새 버전 가용 여부만 확인
+claude-profiler update --yes         # 바로 갱신
+
 # 로컬에 클론한 저장소에서 업데이트
 claude-profiler update --from ~/Projects/claude-profiler
 
-# 원격 저장소 main 브랜치에서 업데이트
+# 다른 git 저장소나 포크에서 업데이트
 claude-profiler update --from https://example.org/claude-profiler.git
 
 # 특정 태그로 업데이트
-claude-profiler update --from https://example.org/claude-profiler.git --ref v0.2.0
+claude-profiler update --from https://github.com/naxreo/claude-profiler.git --ref v0.2.0
 
-# 환경 변수로 고정해두고 짧게 호출
-export CPROF_UPDATE_URL=https://example.org/claude-profiler.git
-claude-profiler update --check       # 새 버전 가용 여부만 확인
-claude-profiler update --yes         # 바로 갱신
+# 환경 변수로 포크/미러 영구 등록
+export CPROF_UPDATE_URL=https://example.org/your-fork.git
+claude-profiler update --yes
 ```
 
 ### 안전 사항
@@ -277,6 +296,30 @@ claude-profiler update --yes         # 바로 갱신
 ### 종료 코드
 
 - 0 성공 (또는 `--check` 정상 종료) / 1 빌드·설치·git clone 실패, 비정상 설치 위치 / 2 잘못된 사용법 / 4 lock 충돌
+
+### 구버전(`update` 명령이 없는 빌드)에서 첫 업그레이드
+
+`update` 가 없는 0.1.0 같은 초기 버전을 이미 설치한 사용자라면 **한 번만** 수동 업그레이드 또는 `bootstrap-update.sh` 로 새 바이너리를 받으면 됩니다. 이후로는 `claude-profiler update` 가 영구적으로 사용 가능합니다.
+
+방법 A — `bootstrap-update.sh` (권장)
+```bash
+# 새 소스 확보 후, 그 소스의 dist/ 안에 동봉된 스크립트 실행
+bash <새-소스>/dist/bootstrap-update.sh --from <새-소스> --yes
+
+# 원격 git 에서 한 번에:
+git clone <repo-url> /tmp/cprof-upgrade
+bash /tmp/cprof-upgrade/dist/bootstrap-update.sh --from /tmp/cprof-upgrade --yes
+rm -rf /tmp/cprof-upgrade
+```
+
+방법 B — install.sh 수동 재실행
+```bash
+cd <새-소스>
+bash build.sh
+bash dist/install.sh --no-shell    # --no-shell 으로 셸 rc 마커 보존
+```
+
+두 방법 모두 사용자 데이터(`~/.claude-profiler/`) 와 셸 rc 마커 블록을 그대로 둡니다. 설치 prefix 는 자동 감지 (PATH 상의 기존 `claude-profiler` 위치 → 못 찾으면 `$HOME/.local`) — 다른 위치였다면 `--prefix <path>` 로 지정.
 
 ---
 

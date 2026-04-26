@@ -32,6 +32,13 @@ claude-profiler switch vanilla
 
 # 클린 슬레이트로 새 프로파일 (Claude Code 재인증 필요)
 claude-profiler create personal --empty
+
+# 새 버전 갱신 — 옵션 없이 공식 GitHub 저장소에서 가져옴 (사용자 데이터/셸 rc 보존)
+claude-profiler update --check       # 새 버전 가용 여부만 확인
+claude-profiler update --yes         # 갱신 실행
+# 다른 저장소/포크에서 갱신하려면: claude-profiler update --from <url|path> --yes
+# update 명령이 없는 구버전(0.1.0)에서 처음 갱신할 땐 dist/bootstrap-update.sh 사용:
+#   bash <새-소스>/dist/bootstrap-update.sh --from <새-소스> --yes
 ```
 
 ## 명령
@@ -49,7 +56,7 @@ claude-profiler create personal --empty
 | `import <path.tgz> [--name <new>]` | 프로파일 가져오기 |
 | `backup list/prune/restore` | 백업 관리 |
 | `uninstall` | 도구 제거 (자세한 옵션은 `docs/USAGE.md`) |
-| `update [--from <url\|path>] [--ref <ref>] [--check]` | 설치된 바이너리를 새 버전으로 갱신 (사용자 데이터/셸 rc 보존) |
+| `update [--from <url\|path>] [--ref <ref>] [--check]` | 설치된 바이너리를 새 버전으로 갱신 (기본 소스: 공식 GitHub. 사용자 데이터/셸 rc 보존) |
 | `doctor` | 일관성 진단 |
 
 ## 동작 방식

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # claude-profiler — single-file build
 # Version: 0.1.0
-# Built: 2026-04-26T14:20:56Z
+# Built: 2026-04-26T14:31:23Z
 set -Eeuo pipefail
 CPROF_VERSION='0.1.0'
 CPROF_BUILT=1
@@ -883,6 +883,9 @@ cprof_switch_to() {
 CPROF_VERSION="${CPROF_VERSION:-0.1.0-dev}"
 CPROF_ROOT="${CPROF_ROOT:-$HOME/.claude-profiler}"
 CPROF_FLAG_YES="${CPROF_FLAG_YES:-0}"
+# update 명령의 기본 원본. 포크/미러 사용자는 빌드 시 이 상수를 바꾸거나
+# 런타임에 CPROF_UPDATE_URL 환경 변수 / --from 으로 덮어쓸 수 있다.
+CPROF_DEFAULT_UPDATE_URL="${CPROF_DEFAULT_UPDATE_URL:-https://github.com/naxreo/claude-profiler.git}"
 
 # Dev mode: source lib files if they exist alongside this script.
 
@@ -911,7 +914,8 @@ claude-profiler — Claude Code 프로파일 관리 도구 (v$CPROF_VERSION)
   backup restore <name>   특정 백업을 임시 위치에 추출.
   uninstall               도구 제거 (옵션은 USAGE 참고).
   update                  설치된 claude-profiler 자체를 새 버전으로 갱신.
-                          --from <git-url|path> 또는 CPROF_UPDATE_URL 필요.
+                          기본 소스: GitHub 공식 저장소.
+                          --from <git-url|path> 또는 CPROF_UPDATE_URL 로 다른 소스 지정.
   doctor                  설정 일관성 검사.
   version                 버전 출력.
   help                    이 도움말.
@@ -1562,11 +1566,17 @@ sub_update() {
   fi
   prefix="$(dirname "$bin_dir")"
 
-  # 2. 소스 결정
-  local src="${opt_from:-${CPROF_UPDATE_URL:-}}"
-  if [[ -z "$src" ]]; then
-    cprof_error "업데이트 소스가 지정되지 않았습니다."
-    cprof_dim "  옵션: claude-profiler update --from <git-url|local-path> [--ref <branch|tag>]"
+  # 2. 소스 결정 — 우선순위: --from > CPROF_UPDATE_URL > 빌트인 기본값(공식 GitHub)
+  local src="" src_origin=""
+  if [[ -n "$opt_from" ]]; then
+    src="$opt_from"; src_origin="옵션"
+  elif [[ -n "${CPROF_UPDATE_URL:-}" ]]; then
+    src="$CPROF_UPDATE_URL"; src_origin="환경변수"
+  elif [[ -n "$CPROF_DEFAULT_UPDATE_URL" ]]; then
+    src="$CPROF_DEFAULT_UPDATE_URL"; src_origin="기본값"
+  else
+    cprof_error "업데이트 소스가 지정되지 않았고 기본값도 비어 있습니다."
+    cprof_dim "  옵션: claude-profiler update --from <git-url|local-path>"
     cprof_dim "  또는 환경 변수: CPROF_UPDATE_URL=<url>"
     return 2
   fi
@@ -1609,7 +1619,7 @@ sub_update() {
   cprof_kv "현재 버전"   "$CPROF_VERSION"
   cprof_kv "새 버전"     "${new_ver:-(unknown)}"
   cprof_kv "설치 prefix" "$prefix"
-  cprof_kv "소스"        "$src"
+  cprof_kv "소스"        "$src ($src_origin)"
   cprof_kv "모드"        "$mode"
 
   if [[ "$opt_check" -eq 1 ]]; then

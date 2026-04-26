@@ -64,9 +64,33 @@ grep -q '# >>> claude-profiler >>>' "$RC" || { echo "shell rc marker stripped"; 
 count="$(grep -c '# >>> claude-profiler >>>' "$RC")"
 [[ "$count" -eq 1 ]] || { echo "shell rc marker duplicated (count=$count)"; exit 1; }
 
-# 8) 소스 미지정 시 에러(코드 2)
+# 8) 소스 우선순위 검증
+#    빌트인 기본값이 바이너리에 컴파일돼 있는지 — 네트워크 없이도 검증 가능
+grep -qF 'https://github.com/naxreo/claude-profiler.git' "$BIN" \
+  || { echo "default GitHub URL not compiled into binary"; exit 1; }
+
+# 8a) 옵션도 env 도 없으면 빌트인 기본값(GitHub) 이 출력에 등장해야 함
+#     실제 clone 은 시도되지만 네트워크 가용성에 의존하지 않게 stderr/stdout 어디든 grep
 unset CPROF_UPDATE_URL
-assert_exit 2 "$BIN" update
+out_default="$("$BIN" update --check 2>&1 || true)"
+echo "$out_default" | grep -qF 'github.com/naxreo/claude-profiler.git' \
+  || { echo "default URL not used when no flags/env: $out_default"; exit 1; }
+echo "$out_default" | grep -qE '(기본값)' \
+  || { echo "default origin label missing: $out_default"; exit 1; }
+
+# 8b) CPROF_UPDATE_URL 이 있으면 기본값을 덮어써야 함 (로컬 디렉토리로 검증 → 네트워크 불필요)
+out_env="$(CPROF_UPDATE_URL="$SRC" "$BIN" update --check 2>&1)"
+echo "$out_env" | grep -qF "$SRC"            || { echo "env CPROF_UPDATE_URL ignored: $out_env"; exit 1; }
+echo "$out_env" | grep -qE '(환경변수)'      || { echo "env origin label missing: $out_env"; exit 1; }
+echo "$out_env" | grep -qF 'github.com/naxreo' && { echo "default leaked when env set: $out_env"; exit 1; }
+:  # ! 의 set -e 호환성
+
+# 8c) --from 이 env 와 기본값을 모두 덮어써야 함
+out_flag="$(CPROF_UPDATE_URL=should-not-be-used "$BIN" update --check --from "$SRC" 2>&1)"
+echo "$out_flag" | grep -qF "$SRC"           || { echo "--from did not override: $out_flag"; exit 1; }
+echo "$out_flag" | grep -qE '(옵션)'         || { echo "--from origin label missing: $out_flag"; exit 1; }
+echo "$out_flag" | grep -qF 'should-not-be-used' && { echo "env leaked when --from set: $out_flag"; exit 1; }
+:
 
 # 9) 정상 설치 위치가 아닌 곳(=$CPROF, dist/claude-profiler)에서 실행하면 거부(코드 1)
 set +e
